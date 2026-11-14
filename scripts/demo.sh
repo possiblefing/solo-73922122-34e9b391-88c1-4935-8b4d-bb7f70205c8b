@@ -73,3 +73,11 @@ req '{"sample_id":"nightly_warehouse_scan",
       "candidates":[{"table":"public.package_scan","columns":["warehouse_id","scan_time"]}]}' | summarize
 echo "  连接池状态："
 curl -sS "$BASE_URL/health" | "$PY" -c "import json,sys; print('  ', json.dumps(json.load(sys.stdin)['pool'], ensure_ascii=False))"
+
+echo
+echo "== 6. 停机交接演示（在途 + 排队评估遇到停机）=="
+echo "  推荐运行可控演示脚本（标准库即可，无需额外依赖）："
+echo "    python3 scripts/shutdown_demo.py $BASE_URL"
+echo "  或手动调用管理接口（会使连接池进入 closed，需重启 API 容器恢复）："
+echo "    curl -sS -X POST $BASE_URL/admin/shutdown -H 'Content-Type: application/json' \\"
+echo "      -d '{\"cancel_inflight\": true, \"wait\": true}' | $PY -m json.tool"

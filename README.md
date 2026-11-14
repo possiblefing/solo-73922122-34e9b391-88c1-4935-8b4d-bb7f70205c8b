@@ -20,6 +20,10 @@
 | 可实际启动的 Docker Compose，/docs 可提交评估 | `docker compose up` 后访问 <http://localhost:8000/docs> |
 | 能改善 / 不能改善计划的索引样例 | `GET /samples`，内置两组样例及配套候选 |
 | 可演示创建候选后暂停、断连再复用连接 | 请求头 `X-Demo-Pause-Seconds`（可选 `X-Demo-Pause-Mode`） |
+| **停机交接：关闭开始即拒绝新租约、排队者立即退出** | 可关闭的租约闸门 `_LeaseGate`：`begin_shutdown()` 关闭闸门并唤醒全部排队 `acquire`，新/排队请求统一抛 `PoolClosedError` → HTTP 503 |
+| **在途评估完成或取消后，先停 DB 工作、清事务/假想索引再关物理连接** | 停机收尾 `_run_shutdown` 等待全部租约归还（复用 `full_cleanup`：取消查询 → ROLLBACK → hypopg_reset 双重验证），逐条关闭并以 `_live` 集合兜底核对 |
+| **重复关闭等待同一轮收尾，close 返回无打开连接、无在途评估** | 所有 `close()` 共享同一个 `asyncio.Event`；`_live` 集合与 `in_use` 双重验证，返回时 `live_connections=0` |
+| **在途/排队评估遇到停机的可控演示** | `POST /admin/shutdown`（`cancel_inflight`、`wait` 参数）+ `scripts/shutdown_demo.py` |
 
 ## 目录结构
 
@@ -42,8 +46,12 @@
 │       ├── validation.py       # 只读 SELECT 解析守卫
 │       ├── schemas.py          # 请求/响应模型
 │       └── samples.py          # 预置样例 SQL 与候选
-├── tests/test_api.py           # 47 项端到端断言
-└── scripts/demo.sh             # 命令行演示（正常评估 / 断连复用）
+├── tests/
+│   ├── test_api.py             # 端到端断言（需运行中的 API + HypoPG Postgres）
+│   └── test_pool_shutdown.py   # 连接池停机交接的无数据库单元测试（74 项断言，假连接）
+└── scripts/
+    ├── demo.sh                 # 命令行演示（正常评估 / 断连复用）
+    └── shutdown_demo.py        # 在途与排队评估遇到停机的可控演示（仅标准库）
 ```
 
 ## 启动
@@ -110,6 +118,70 @@ curl -X POST http://localhost:8000/evaluate \
 
 也可直接运行 `bash scripts/demo.sh`。
 
+### 4) 停机交接演示：在途与排队评估同时遇到停机
+
+夜间索引评估服务重启时，旧评估可能仍占用连接，新请求还在排队。本服务的
+连接池保证严格的停机交接（实现见 `api/app/db.py`）：
+
+1. **关闭开始即拒绝新租约**：`begin_shutdown()` 关闭可唤醒的租约闸门，
+   之后任何 `lease()` 立即抛 `PoolClosedError`，HTTP 层映射为 **503
+   `pool_closing`**，绝不会在已关闭的池上继续评估；
+2. **排队请求立即退出**：闸门关闭会唤醒所有阻塞在 `acquire()` 上的请求，
+   它们拿到同一个 `PoolClosedError` 退出，而不是继续等待并在停机后评估；
+3. **在途评估完成或被取消后再关物理连接**：收尾协程等待全部租约归还。
+   每条连接在物理关闭前都走同一条 `full_cleanup`——先发 `cancel()` 停掉
+   在途数据库工作并等待确认，再 `ROLLBACK`、`hypopg_reset`，并以协议事务
+   状态 `IDLE` + 假想索引计数 0 双重验证；不可确认干净的连接直接关闭丢弃；
+4. **重复关闭等待同一轮收尾**：所有 `close()` 共享一个 `asyncio.Event`，
+   后到调用只等待不重复收尾。`close()` 返回时 `live_connections=0`、
+   `in_use=0`，没有打开的连接，也没有仍在执行的评估。
+
+可控演示（推荐，无需手速）：
+
+```bash
+python3 scripts/shutdown_demo.py            # 默认 http://localhost:8000
+# 脚本会：
+#  1) 发起 2 个带 X-Demo-Pause 的在途评估（占满两条连接）
+#  2) 再发起 3 个排队评估（阻塞等连接）
+#  3) 调用 POST /admin/shutdown 触发停机交接
+#  4) 打印在途/排队请求的最终状态（均为 503 pool_closing）
+#  5) 调用 /health 确认 state=closed、live_connections=0、in_use=0
+```
+
+也可手动触发。`/admin/shutdown` 的两个参数：
+
+| 参数 | 默认 | 含义 |
+| --- | --- | --- |
+| `cancel_inflight` | `true` | 取消在途评估（等价重启时 uvicorn 取消请求任务）；`false` 则等待在途自然完成 |
+| `wait` | `true` | 同步等待本轮收尾（所有物理连接关闭）后再返回 |
+
+```bash
+# 终端 A：两个暂停中的在途评估占满连接，第三个请求排队
+for i in 1 2; do
+  curl -s -X POST http://localhost:8000/evaluate \
+    -H 'Content-Type: application/json' -H 'X-Demo-Pause-Seconds: 30' \
+    -d '{"sample_id":"nightly_warehouse_scan",
+         "candidates":[{"table":"public.package_scan","columns":["warehouse_id","scan_time"]}]}' &
+done
+# 终端 B：触发停机（取消在途、等待收尾完成）
+curl -s -X POST http://localhost:8000/admin/shutdown \
+  -H 'Content-Type: application/json' -d '{"cancel_inflight": true, "wait": true}'
+# 返回体 pool.live_connections 必为 0；此时新请求一律 503
+curl -s http://localhost:8000/health
+```
+
+> 注意：`/admin/shutdown` 会让进程内连接池进入不可恢复的 `closed` 状态，
+> 仅用于演示/运维验证；触发后需重启 API 容器才能再次评估。真实进程重启
+> （`docker compose restart api` / SIGTERM）走的是同一条交接路径，由
+> lifespan 的 `shutdown` 事件调用幂等的 `pool.close()`，uvicorn 配置了
+> `--timeout-graceful-shutdown 30` 等待在途清理。
+
+无数据库也可验证全部停机语义（假连接驱动真实连接池，74 项断言）：
+
+```bash
+python -I tests/test_pool_shutdown.py
+```
+
 ## 安全设计
 
 1. **SQL 只读双保险**：`sqlparse` 词法层拒绝多语句与一切写/DDL 关键字；
@@ -122,7 +194,14 @@ curl -X POST http://localhost:8000/evaluate \
 
 ## 本地（无 Docker）运行测试
 
-仓库的测试可指向任意已装 HypoPG 的 Postgres：
+连接池停机交接的单元测试**不需要数据库**（用假连接驱动真实池实现）：
+
+```bash
+pip install -r api/requirements.txt httpx
+python -I tests/test_pool_shutdown.py
+```
+
+仓库的端到端测试可指向任意已装 HypoPG 的 Postgres：
 
 ```bash
 pip install -r api/requirements.txt

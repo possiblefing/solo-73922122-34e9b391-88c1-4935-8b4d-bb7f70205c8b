@@ -9,5 +9,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 
 # 单 worker 单进程：连接池上限 2 才严格等价于“单 API 进程最多两条连接”
+# 优雅停机给 30s：足够在途评估完成或被取消后的“停查询→ROLLBACK→hypopg_reset→关连接”收尾
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log", "--timeout-graceful-shutdown", "30"]
